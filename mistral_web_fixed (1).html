@@ -4019,26 +4019,47 @@ async function sendMessageWithWebSearch() {
   const agentMaxTok = state.agent?.maxTokens || 4096;
 
   try {
-    const res = await fetch("https://api.mistral.ai/v1/chat/completions", {
+    // Essayer d'abord avec web_search (nouveau format Mistral)
+    let res = await fetch("https://api.mistral.ai/v1/chat/completions", {
       method: "POST",
       headers: { "Authorization": `Bearer ${state.apiKey}`, "Content-Type": "application/json" },
       body: JSON.stringify({
         model: activeModelId,
         messages: [
-          { role:"system", content: buildSystemPrompt() + "\n\nTu as accès à la recherche web en temps réel. Utilise-la pour toute question sur l'actualité, les prix, la météo, les événements récents, ou toute info pouvant avoir changé. Cite tes sources." },
+          { role:"system", content: buildSystemPrompt() + "\n\nTu as accès à la recherche web en temps réel. Utilise-la pour toute question sur l'actualité, les prix, la météo, les événements récents, ou toute info pouvant avoir changé. Cite tes sources avec des liens." },
           ...(state.messages||[]).filter(m => m.role !== 'system').slice(-20).map(m => ({ role:m.role, content:m.content }))
         ],
         temperature: agentTemp,
         max_tokens: agentMaxTok,
-        tools: [{ type: "web_search_preview" }],
+        tools: [{ type: "web_search" }],
         tool_choice: "auto"
       })
     });
+
+    // Si web_search échoue, essayer web_search_preview (ancien format)
+    if (!res.ok && res.status === 400) {
+      res = await fetch("https://api.mistral.ai/v1/chat/completions", {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${state.apiKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: activeModelId,
+          messages: [
+            { role:"system", content: buildSystemPrompt() + "\n\nTu as accès à la recherche web en temps réel. Utilise-la pour toute question sur l'actualité, les prix, la météo, les événements récents, ou toute info pouvant avoir changé. Cite tes sources avec des liens." },
+            ...(state.messages||[]).filter(m => m.role !== 'system').slice(-20).map(m => ({ role:m.role, content:m.content }))
+          ],
+          temperature: agentTemp,
+          max_tokens: agentMaxTok,
+          tools: [{ type: "web_search_preview" }],
+          tool_choice: "auto"
+        })
+      });
+    }
 
     if (!res.ok) {
       const err = await res.text();
       let errMsg = err.slice(0, 300);
       try { const j = JSON.parse(err); errMsg = j.message || j.error?.message || errMsg; } catch(e) {}
+      
       // Fallback: si web_search non dispo sur ce modèle, on relance sans
       if (res.status === 400 || errMsg.toLowerCase().includes("tool") || errMsg.toLowerCase().includes("web_search") || errMsg.toLowerCase().includes("not support") || errMsg.toLowerCase().includes("unsupported")) {
         toast("⚠ Ce modèle ne supporte pas la recherche web native. Réponse sans recherche.", "info");
@@ -4052,6 +4073,7 @@ async function sendMessageWithWebSearch() {
         hideTyping();
         $("#send-btn").disabled = false;
         $("#send-btn").innerHTML = "SEND ▶";
+        state.messages.pop(); // Remove the user message we just added
         return _sendMessageOriginal();
       }
       throw new Error(errMsg);
@@ -4060,8 +4082,13 @@ async function sendMessageWithWebSearch() {
     const data = await res.json();
     let reply = data.choices?.[0]?.message?.content || "Aucune réponse";
     
-    // Add web search indicator to reply
-    reply = `🌐 *Recherche web effectuée*\n\n${reply}`;
+    // Check for tool calls in response
+    const toolCalls = data.choices?.[0]?.message?.tool_calls;
+    if (toolCalls && toolCalls.length > 0) {
+      reply = "🌐 *Recherche web effectuée*\n\n" + reply;
+    } else {
+      reply = "🌐 *Recherche web activée*\n\n" + reply;
+    }
 
     hideTyping();
     state.messages.push({ role:"assistant", content:reply, ts:now(), webSearch:true, memoryUsed:relevantMems.length?relevantMems:undefined });
@@ -4251,9 +4278,18 @@ function initVoiceMode() {
   // Check browser support
   const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SpeechRecognition) {
-    btn.title = "Mode vocal non supporté par ce navigateur (Chrome recommandé)";
+    btn.disabled = true;
+    btn.title = "Mode vocal non supporté — Utilisez Chrome ou Edge";
     btn.style.opacity = "0.4";
+    btn.textContent = "🎤 NON DISP.";
     return;
+  }
+  
+  // Load voices when available
+  if (voiceSynth) {
+    voiceSynth.onvoiceschanged = () => {
+      // Voices loaded, ready to speak
+    };
   }
 
   const setOrbState = (state) => {
@@ -4410,15 +4446,44 @@ async function sendVoiceToMistral(text) {
     { role:"user", content: text }
   ];
 
-  const tools = webSearchEnabled ? [{ type: "web_search_preview" }] : undefined;
-  const body = { model: activeModelId, messages: contextMessages, temperature: agentTemp, max_tokens: 512 };
+  let tools = undefined;
+  if (webSearchEnabled) {
+    tools = [{ type: "web_search" }];
+  }
+  
+  let body = { model: activeModelId, messages: contextMessages, temperature: agentTemp, max_tokens: 512 };
   if (tools) { body.tools = tools; body.tool_choice = "auto"; }
 
-  const res = await fetch("https://api.mistral.ai/v1/chat/completions", {
+  let res = await fetch("https://api.mistral.ai/v1/chat/completions", {
     method: "POST",
     headers: { "Authorization": `Bearer ${state.apiKey}`, "Content-Type": "application/json" },
     body: JSON.stringify(body)
   });
+  
+  // Fallback to web_search_preview if web_search fails
+  if (!res.ok && res.status === 400 && webSearchEnabled) {
+    body.tools = [{ type: "web_search_preview" }];
+    res = await fetch("https://api.mistral.ai/v1/chat/completions", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${state.apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+  }
+  
+  // If still failing and web search is enabled, disable it and retry without tools
+  if (!res.ok && webSearchEnabled) {
+    webSearchEnabled = false;
+    const btn = $("#toggle-websearch");
+    if (btn) { btn.classList.remove("web-active"); btn.textContent = "🌐 WEB"; }
+    delete body.tools;
+    delete body.tool_choice;
+    res = await fetch("https://api.mistral.ai/v1/chat/completions", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${state.apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+  }
+  
   if (!res.ok) { const err = await res.text(); throw new Error(err.slice(0,200)); }
   const data = await res.json();
   return data.choices?.[0]?.message?.content || "Je n'ai pas compris, pouvez-vous répéter ?";
