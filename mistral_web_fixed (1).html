@@ -4019,15 +4019,21 @@ async function sendMessageWithWebSearch() {
   const agentMaxTok = state.agent?.maxTokens || 4096;
 
   try {
-    // Essayer d'abord avec web_search (nouveau format Mistral)
+    // Build system prompt with web search instruction
+    const systemPrompt = buildSystemPrompt() + "\n\nTu as accès à la recherche web en temps réel. Utilise-la pour toute question sur l'actualité, les prix, la météo, les événements récents, ou toute info pouvant avoir changé. Cite tes sources avec des liens.";
+    
+    // Get conversation history
+    const conversationHistory = (state.messages||[]).filter(m => m.role !== 'system').slice(-20).map(m => ({ role:m.role, content:m.content }));
+
+    // First attempt: Try with web_search tool
     let res = await fetch("https://api.mistral.ai/v1/chat/completions", {
       method: "POST",
       headers: { "Authorization": `Bearer ${state.apiKey}`, "Content-Type": "application/json" },
       body: JSON.stringify({
         model: activeModelId,
         messages: [
-          { role:"system", content: buildSystemPrompt() + "\n\nTu as accès à la recherche web en temps réel. Utilise-la pour toute question sur l'actualité, les prix, la météo, les événements récents, ou toute info pouvant avoir changé. Cite tes sources avec des liens." },
-          ...(state.messages||[]).filter(m => m.role !== 'system').slice(-20).map(m => ({ role:m.role, content:m.content }))
+          { role:"system", content: systemPrompt },
+          ...conversationHistory
         ],
         temperature: agentTemp,
         max_tokens: agentMaxTok,
@@ -4036,16 +4042,16 @@ async function sendMessageWithWebSearch() {
       })
     });
 
-    // Si web_search échoue, essayer web_search_preview (ancien format)
-    if (!res.ok && res.status === 400) {
+    // Second attempt: Try with web_search_preview if first fails
+    if (!res.ok && (res.status === 400 || res.status === 403)) {
       res = await fetch("https://api.mistral.ai/v1/chat/completions", {
         method: "POST",
         headers: { "Authorization": `Bearer ${state.apiKey}`, "Content-Type": "application/json" },
         body: JSON.stringify({
           model: activeModelId,
           messages: [
-            { role:"system", content: buildSystemPrompt() + "\n\nTu as accès à la recherche web en temps réel. Utilise-la pour toute question sur l'actualité, les prix, la météo, les événements récents, ou toute info pouvant avoir changé. Cite tes sources avec des liens." },
-            ...(state.messages||[]).filter(m => m.role !== 'system').slice(-20).map(m => ({ role:m.role, content:m.content }))
+            { role:"system", content: systemPrompt },
+            ...conversationHistory
           ],
           temperature: agentTemp,
           max_tokens: agentMaxTok,
@@ -4055,13 +4061,21 @@ async function sendMessageWithWebSearch() {
       });
     }
 
+    // Handle errors
     if (!res.ok) {
       const err = await res.text();
       let errMsg = err.slice(0, 300);
       try { const j = JSON.parse(err); errMsg = j.message || j.error?.message || errMsg; } catch(e) {}
       
-      // Fallback: si web_search non dispo sur ce modèle, on relance sans
-      if (res.status === 400 || errMsg.toLowerCase().includes("tool") || errMsg.toLowerCase().includes("web_search") || errMsg.toLowerCase().includes("not support") || errMsg.toLowerCase().includes("unsupported")) {
+      // Check if error is related to web search not being supported
+      const isWebSearchError = errMsg.toLowerCase().includes("tool") || 
+                               errMsg.toLowerCase().includes("web_search") || 
+                               errMsg.toLowerCase().includes("not support") || 
+                               errMsg.toLowerCase().includes("unsupported") ||
+                               errMsg.toLowerCase().includes("invalid") ||
+                               errMsg.toLowerCase().includes("parameter");
+      
+      if (isWebSearchError || res.status === 400 || res.status === 403) {
         toast("⚠ Ce modèle ne supporte pas la recherche web native. Réponse sans recherche.", "info");
         webSearchEnabled = false;
         const btn = $("#toggle-websearch");
