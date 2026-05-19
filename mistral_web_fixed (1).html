@@ -2948,8 +2948,13 @@ window.clearAttachedFile = () => {
   updateFilePreview();
 };
 
-// Override sendMessage to handle file attachments
+// Override sendMessage to handle file attachments and web search
 async function sendMessage() {
+  // Check if web search is enabled
+  if (webSearchEnabled) {
+    return sendMessageWithWebSearch();
+  }
+  
   const txt = document.getElementById('user-input').value.trim();
   if (!txt && !state.attachedFile) return;
   if (!state.apiKey) {
@@ -3974,7 +3979,7 @@ function initWebSearch() {
       webSearchEnabled = true;
       btn.classList.add("web-active");
       btn.textContent = "🌐 WEB ✓";
-      bar.style.display = "flex";
+      if (bar) bar.style.display = "flex";
     }
   }).catch(()=>{});
 
@@ -3982,17 +3987,14 @@ function initWebSearch() {
     webSearchEnabled = !webSearchEnabled;
     btn.classList.toggle("web-active", webSearchEnabled);
     btn.textContent = webSearchEnabled ? "🌐 WEB ✓" : "🌐 WEB";
-    bar.style.display = webSearchEnabled ? "flex" : "none";
+    if (bar) bar.style.display = webSearchEnabled ? "flex" : "none";
     db.put('settings', { id:'websearch', value: webSearchEnabled }).catch(()=>{});
     toast(webSearchEnabled ? "🌐 Recherche web activée — Mistral navigue sur internet" : "Recherche web désactivée", webSearchEnabled ? "success" : "info");
   };
 }
 
-// Patch _sendMessageOriginal to inject web_search tool when enabled
-const _origSendMessage = _sendMessageOriginal.bind({});
-_sendMessageOriginal = async function() {
-  if (!webSearchEnabled) return _origSendMessage.apply(this, arguments);
-
+// Wrapper pour envoyer les messages avec recherche web
+async function sendMessageWithWebSearch() {
   const txt = $("#user-input").value.trim();
   if (!txt) return;
   if (!state.apiKey) {
@@ -4016,21 +4018,16 @@ _sendMessageOriginal = async function() {
   const agentTemp = state.agent?.temperature !== undefined ? state.agent.temperature : model.temp;
   const agentMaxTok = state.agent?.maxTokens || 4096;
 
-  const contextMessages = [
-    { role:"system", content: buildSystemPrompt() + "\n\nTu as accès à la recherche web en temps réel. Utilise-la pour toute question sur l'actualité, les prix, la météo, les événements récents, ou toute info pouvant avoir changé. Cite tes sources." },
-    ...(state.messages||[]).filter(m => m.role !== 'system').slice(-20).map(m => ({ role:m.role, content:m.content }))
-  ];
-  if (relevantMems.length) {
-    contextMessages.splice(1, 0, { role:"user", content:`[Mémoire globale]\n${relevantMems.join('\n')}` });
-  }
-
   try {
     const res = await fetch("https://api.mistral.ai/v1/chat/completions", {
       method: "POST",
       headers: { "Authorization": `Bearer ${state.apiKey}`, "Content-Type": "application/json" },
       body: JSON.stringify({
         model: activeModelId,
-        messages: contextMessages,
+        messages: [
+          { role:"system", content: buildSystemPrompt() + "\n\nTu as accès à la recherche web en temps réel. Utilise-la pour toute question sur l'actualité, les prix, la météo, les événements récents, ou toute info pouvant avoir changé. Cite tes sources." },
+          ...(state.messages||[]).filter(m => m.role !== 'system').slice(-20).map(m => ({ role:m.role, content:m.content }))
+        ],
         temperature: agentTemp,
         max_tokens: agentMaxTok,
         tools: [{ type: "web_search_preview" }],
@@ -4048,50 +4045,23 @@ _sendMessageOriginal = async function() {
         webSearchEnabled = false;
         const btn = $("#toggle-websearch");
         if (btn) { btn.classList.remove("web-active"); btn.textContent = "🌐 WEB"; }
-        $("#websearch-status-bar").style.display = "none";
-        return _origSendMessage();
+        const bar = $("#websearch-status-bar");
+        if (bar) bar.style.display = "none";
+        db.put('settings', { id:'websearch', value: false }).catch(()=>{});
+        // Retry without web search using original send function
+        hideTyping();
+        $("#send-btn").disabled = false;
+        $("#send-btn").innerHTML = "SEND ▶";
+        return _sendMessageOriginal();
       }
       throw new Error(errMsg);
     }
 
     const data = await res.json();
-    // Handle tool_calls (web search was triggered)
-    let reply = "";
-    const choice = data.choices?.[0];
-    if (choice?.message?.tool_calls?.length) {
-      // Mistral did web search — get finish message
-      reply = choice.message?.content || "";
-      // Second turn: send tool results back
-      const toolCalls = choice.message.tool_calls;
-      const toolMessages = [
-        ...contextMessages,
-        { role: "assistant", content: choice.message.content || "", tool_calls: toolCalls }
-      ];
-      // Mistral handles web_search internally and returns grounded answer — just use content
-      if (!reply) {
-        // Re-request with tool results acknowledged
-        const res2 = await fetch("https://api.mistral.ai/v1/chat/completions", {
-          method: "POST",
-          headers: { "Authorization": `Bearer ${state.apiKey}`, "Content-Type": "application/json" },
-          body: JSON.stringify({
-            model: activeModelId,
-            messages: toolMessages,
-            temperature: agentTemp,
-            max_tokens: agentMaxTok,
-            top_p: 0.95
-          })
-        });
-        if (res2.ok) {
-          const data2 = await res2.json();
-          reply = data2.choices?.[0]?.message?.content || "Aucune réponse";
-        }
-      }
-    } else {
-      reply = choice?.message?.content || "Aucune réponse";
-    }
-
+    let reply = data.choices?.[0]?.message?.content || "Aucune réponse";
+    
     // Add web search indicator to reply
-    if (reply) reply = `🌐 *Recherche web effectuée*\n\n${reply}`;
+    reply = `🌐 *Recherche web effectuée*\n\n${reply}`;
 
     hideTyping();
     state.messages.push({ role:"assistant", content:reply, ts:now(), webSearch:true, memoryUsed:relevantMems.length?relevantMems:undefined });
@@ -4107,7 +4077,7 @@ _sendMessageOriginal = async function() {
     $("#send-btn").innerHTML = "SEND ▶";
     updateContextMeter();
   }
-};
+}
 
 // ════════════════════════════════════════
 // 🎨 FEATURE 2 — IMAGE GENERATION (Nano Banana / Google Gemini)
