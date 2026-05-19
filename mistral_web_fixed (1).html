@@ -3964,7 +3964,7 @@ function bindEvents() {
 }
 
 // ════════════════════════════════════════
-// 🌐 FEATURE 1 — WEB SEARCH (Mistral Native)
+// 🌐 FEATURE 1 — WEB SEARCH (Mistral Native + Fallback)
 // ════════════════════════════════════════
 let webSearchEnabled = false;
 
@@ -3989,7 +3989,7 @@ function initWebSearch() {
     btn.textContent = webSearchEnabled ? "🌐 WEB ✓" : "🌐 WEB";
     if (bar) bar.style.display = webSearchEnabled ? "flex" : "none";
     db.put('settings', { id:'websearch', value: webSearchEnabled }).catch(()=>{});
-    toast(webSearchEnabled ? "🌐 Recherche web activée — Mistral navigue sur internet" : "Recherche web désactivée", webSearchEnabled ? "success" : "info");
+    toast(webSearchEnabled ? "🌐 Recherche web activée" : "Recherche web désactivée", webSearchEnabled ? "success" : "info");
   };
 }
 
@@ -4044,6 +4044,7 @@ async function sendMessageWithWebSearch() {
 
     // Second attempt: Try with web_search_preview if first fails
     if (!res.ok && (res.status === 400 || res.status === 403)) {
+      console.log("web_search failed, trying web_search_preview...");
       res = await fetch("https://api.mistral.ai/v1/chat/completions", {
         method: "POST",
         headers: { "Authorization": `Bearer ${state.apiKey}`, "Content-Type": "application/json" },
@@ -4067,15 +4068,20 @@ async function sendMessageWithWebSearch() {
       let errMsg = err.slice(0, 300);
       try { const j = JSON.parse(err); errMsg = j.message || j.error?.message || errMsg; } catch(e) {}
       
+      console.log("Web search error:", errMsg, "Status:", res.status);
+      
       // Check if error is related to web search not being supported
       const isWebSearchError = errMsg.toLowerCase().includes("tool") || 
                                errMsg.toLowerCase().includes("web_search") || 
                                errMsg.toLowerCase().includes("not support") || 
                                errMsg.toLowerCase().includes("unsupported") ||
                                errMsg.toLowerCase().includes("invalid") ||
-                               errMsg.toLowerCase().includes("parameter");
+                               errMsg.toLowerCase().includes("parameter") ||
+                               errMsg.toLowerCase().includes("unknown") ||
+                               errMsg.toLowerCase().includes("does not exist");
       
       if (isWebSearchError || res.status === 400 || res.status === 403) {
+        console.log("Web search not supported by this model, falling back to normal mode");
         toast("⚠ Ce modèle ne supporte pas la recherche web native. Réponse sans recherche.", "info");
         webSearchEnabled = false;
         const btn = $("#toggle-websearch");
@@ -4088,7 +4094,7 @@ async function sendMessageWithWebSearch() {
         $("#send-btn").disabled = false;
         $("#send-btn").innerHTML = "SEND ▶";
         state.messages.pop(); // Remove the user message we just added
-        return _sendMessageOriginal();
+        return await _sendMessageOriginal();
       }
       throw new Error(errMsg);
     }
@@ -4109,8 +4115,9 @@ async function sendMessageWithWebSearch() {
     renderMessages();
     await saveChat();
   } catch(e) {
+    console.error("Web search error:", e);
     hideTyping();
-    toast(`Erreur API Web Search : ${e.message.slice(0,100)}`, "error");
+    toast(`Erreur Web Search : ${e.message.slice(0,100)}`, "error");
     state.messages.push({ role:"assistant", content:`⚠ Erreur web search : ${e.message}`, ts:now() });
     renderMessages();
   } finally {
@@ -4476,6 +4483,7 @@ async function sendVoiceToMistral(text) {
   
   // Fallback to web_search_preview if web_search fails
   if (!res.ok && res.status === 400 && webSearchEnabled) {
+    console.log("Voice: web_search failed, trying web_search_preview...");
     body.tools = [{ type: "web_search_preview" }];
     res = await fetch("https://api.mistral.ai/v1/chat/completions", {
       method: "POST",
@@ -4486,19 +4494,33 @@ async function sendVoiceToMistral(text) {
   
   // If still failing and web search is enabled, disable it and retry without tools
   if (!res.ok && webSearchEnabled) {
-    webSearchEnabled = false;
-    const btn = $("#toggle-websearch");
-    if (btn) { btn.classList.remove("web-active"); btn.textContent = "🌐 WEB"; }
-    delete body.tools;
-    delete body.tool_choice;
-    res = await fetch("https://api.mistral.ai/v1/chat/completions", {
-      method: "POST",
-      headers: { "Authorization": `Bearer ${state.apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify(body)
-    });
+    const errText = await res.text().catch(() => "");
+    const isWebSearchError = errText.toLowerCase().includes("tool") || 
+                             errText.toLowerCase().includes("web_search") || 
+                             errText.toLowerCase().includes("not support") || 
+                             errText.toLowerCase().includes("unsupported") ||
+                             errText.toLowerCase().includes("invalid") ||
+                             errText.toLowerCase().includes("unknown");
+    
+    if (isWebSearchError || res.status === 400 || res.status === 403) {
+      console.log("Voice: Web search not supported, retrying without tools");
+      webSearchEnabled = false;
+      const btn = $("#toggle-websearch");
+      if (btn) { btn.classList.remove("web-active"); btn.textContent = "🌐 WEB"; }
+      delete body.tools;
+      delete body.tool_choice;
+      res = await fetch("https://api.mistral.ai/v1/chat/completions", {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${state.apiKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+    }
   }
   
-  if (!res.ok) { const err = await res.text(); throw new Error(err.slice(0,200)); }
+  if (!res.ok) { 
+    const err = await res.text().catch(() => "Erreur inconnue"); 
+    throw new Error(err.slice(0,200)); 
+  }
   const data = await res.json();
   return data.choices?.[0]?.message?.content || "Je n'ai pas compris, pouvez-vous répéter ?";
 }
