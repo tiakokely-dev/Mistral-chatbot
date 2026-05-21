@@ -2889,7 +2889,7 @@ window.rateMessage = async (ts, score) => {
 };
 
 // ════════════════════════════════════════
-// FILE UPLOAD FOR VISION/AUDIO
+// FILE UPLOAD FOR VISION/AUDIO/TEXT
 // ════════════════════════════════════════
 function initFileUpload() {
   const btn = document.getElementById('file-upload-btn');
@@ -2904,6 +2904,11 @@ function initFileUpload() {
     const isAudio = model?.audio || state.model.includes('voxtral');
     const isImage = file.type.startsWith('image/');
     const isAudioFile = file.type.startsWith('audio/');
+    const isTextFile = file.type === 'text/plain' || 
+                       file.name.endsWith('.txt') || 
+                       file.name.endsWith('.md') || 
+                       file.name.endsWith('.csv') || 
+                       file.name.endsWith('.json');
     if (isImage) {
       // Convert to base64
       const reader = new FileReader();
@@ -2919,8 +2924,16 @@ function initFileUpload() {
         updateFilePreview();
       };
       reader.readAsDataURL(file);
+    } else if (isTextFile) {
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        const content = ev.target.result.slice(0, 8000); // Limite tokens
+        state.attachedFile = { type: 'text', data: content, name: file.name, mimeType: file.type };
+        updateFilePreview();
+      };
+      reader.readAsText(file);
     } else {
-      toast("Format non supporté. Utilisez image/* ou audio/*", "error");
+      toast("Format non supporté. Utilisez image/*, audio/* ou texte (.txt, .md, .csv, .json)", "error");
     }
     inp.value = '';
   };
@@ -2939,7 +2952,7 @@ function updateFilePreview() {
     preview.className = 'file-preview';
     area.parentNode.insertBefore(preview, area);
   }
-  const icon = state.attachedFile.type === 'image' ? '🖼' : '🎵';
+  const icon = state.attachedFile.type === 'image' ? '🖼' : (state.attachedFile.type === 'text' ? '📄' : '🎵');
   preview.innerHTML = `${icon} <strong style="color:var(--cyan)">${state.attachedFile.name}</strong><button class="file-preview-remove" onclick="clearAttachedFile()">✕ Retirer</button>`;
 }
 
@@ -2964,14 +2977,14 @@ async function sendMessage() {
   }
 
   const model = MODELS.find(m => m.id === state.model) || MODELS[0];
-  const isVision = state.model.includes('pixtral');
+  const isVision = model?.vision || state.model.includes('pixtral') || state.model.includes('mistral-large') || state.model.includes('mistral-medium') || state.model.includes('ministral');
   const isAudio = state.model.includes('voxtral');
 
-  if (state.attachedFile && (isVision || isAudio)) {
+  if (state.attachedFile && (isVision || isAudio || state.attachedFile.type === 'text')) {
     // Multi-modal message
     const userMsg = {
       role: "user",
-      content: txt || (state.attachedFile.type === 'image' ? "Décris cette image" : "Transcris cet audio"),
+      content: txt || (state.attachedFile.type === 'image' ? "Décris cette image" : (state.attachedFile.type === 'text' ? "Analyse ce fichier" : "Transcris cet audio")),
       ts: now(),
       imageData: state.attachedFile.type === 'image' ? state.attachedFile.data : null,
       audioName: state.attachedFile.type === 'audio' ? state.attachedFile.name : null
@@ -2989,7 +3002,7 @@ async function sendMessage() {
     // Build multimodal content
     let msgContent = [];
     if (state.attachedFile.type === 'image') {
-      msgContent.push({ type: "image_url", image_url: state.attachedFile.data });
+      msgContent.push({ type: "image_url", image_url: { url: state.attachedFile.data } });
     }
     if (txt) msgContent.push({ type: "text", text: txt });
     else msgContent.push({ type: "text", text: "Analyse cette image en détail." });
@@ -3027,9 +3040,16 @@ async function sendMessage() {
     return;
   }
 
-  if (state.attachedFile && !isVision && !isAudio) {
+  if (state.attachedFile && !isVision && !isAudio && state.attachedFile.type !== 'text') {
     toast("Ce modèle ne supporte pas les fichiers. Utilisez un modèle Vision (Mistral Large 3, Ministral 3) ou Voxtral pour audio.", "error");
     return;
+  }
+
+  // Handle text file attachment for normal message flow
+  let userContent = txt;
+  if (state.attachedFile?.type === 'text') {
+    const fileContent = `\n\n[Fichier joint : ${state.attachedFile.name}]\n\`\`\`\n${state.attachedFile.data}\n\`\`\``;
+    userContent = txt + fileContent;
   }
 
   // Normal text message - use original logic but with agent temperature
@@ -4019,14 +4039,14 @@ async function sendMessageWithWebSearch() {
   const agentMaxTok = state.agent?.maxTokens || 4096;
 
   try {
-    // Build system prompt with web search instruction
-    const systemPrompt = buildSystemPrompt() + "\n\nTu as accès à la recherche web en temps réel. Utilise-la pour toute question sur l'actualité, les prix, la météo, les événements récents, ou toute info pouvant avoir changé. Cite tes sources avec des liens.";
+    // NOTE: Mistral API ne supporte pas les tools web_search nativement dans /v1/chat/completions
+    // On utilise donc une instruction system forte pour demander au modèle de se baser sur ses connaissances
+    const systemPrompt = buildSystemPrompt() + "\\n\\nPour toute question sur l'actualité, les événements récents ou les informations pouvant avoir changé, indique clairement que tu ne peux pas accéder au web en temps réel et base-toi sur tes connaissances internes. Si l'utilisateur a besoin d'informations à jour, suggère-lui de consulter une source externe.";
     
     // Get conversation history
     const conversationHistory = (state.messages||[]).filter(m => m.role !== 'system').slice(-20).map(m => ({ role:m.role, content:m.content }));
 
-    // First attempt: Try with web_search tool
-    let res = await fetch("https://api.mistral.ai/v1/chat/completions", {
+    const res = await fetch("https://api.mistral.ai/v1/chat/completions", {
       method: "POST",
       headers: { "Authorization": `Bearer ${state.apiKey}`, "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -4036,82 +4056,23 @@ async function sendMessageWithWebSearch() {
           ...conversationHistory
         ],
         temperature: agentTemp,
-        max_tokens: agentMaxTok,
-        tools: [{ type: "web_search" }],
-        tool_choice: "auto"
+        max_tokens: agentMaxTok
       })
     });
-
-    // Second attempt: Try with web_search_preview if first fails
-    if (!res.ok && (res.status === 400 || res.status === 403)) {
-      console.log("web_search failed, trying web_search_preview...");
-      res = await fetch("https://api.mistral.ai/v1/chat/completions", {
-        method: "POST",
-        headers: { "Authorization": `Bearer ${state.apiKey}`, "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: activeModelId,
-          messages: [
-            { role:"system", content: systemPrompt },
-            ...conversationHistory
-          ],
-          temperature: agentTemp,
-          max_tokens: agentMaxTok,
-          tools: [{ type: "web_search_preview" }],
-          tool_choice: "auto"
-        })
-      });
-    }
 
     // Handle errors
     if (!res.ok) {
       const err = await res.text();
       let errMsg = err.slice(0, 300);
       try { const j = JSON.parse(err); errMsg = j.message || j.error?.message || errMsg; } catch(e) {}
-      
-      console.log("Web search error:", errMsg, "Status:", res.status);
-      
-      // Check if error is related to web search not being supported
-      const isWebSearchError = errMsg.toLowerCase().includes("tool") || 
-                               errMsg.toLowerCase().includes("web_search") || 
-                               errMsg.toLowerCase().includes("not support") || 
-                               errMsg.toLowerCase().includes("unsupported") ||
-                               errMsg.toLowerCase().includes("invalid") ||
-                               errMsg.toLowerCase().includes("parameter") ||
-                               errMsg.toLowerCase().includes("unknown") ||
-                               errMsg.toLowerCase().includes("does not exist");
-      
-      if (isWebSearchError || res.status === 400 || res.status === 403) {
-        console.log("Web search not supported by this model, falling back to normal mode");
-        toast("⚠ Ce modèle ne supporte pas la recherche web native. Réponse sans recherche.", "info");
-        webSearchEnabled = false;
-        const btn = $("#toggle-websearch");
-        if (btn) { btn.classList.remove("web-active"); btn.textContent = "🌐 WEB"; }
-        const bar = $("#websearch-status-bar");
-        if (bar) bar.style.display = "none";
-        db.put('settings', { id:'websearch', value: false }).catch(()=>{});
-        // Retry without web search using original send function
-        hideTyping();
-        $("#send-btn").disabled = false;
-        $("#send-btn").innerHTML = "SEND ▶";
-        state.messages.pop(); // Remove the user message we just added
-        return await _sendMessageOriginal();
-      }
       throw new Error(errMsg);
     }
 
     const data = await res.json();
     let reply = data.choices?.[0]?.message?.content || "Aucune réponse";
     
-    // Check for tool calls in response
-    const toolCalls = data.choices?.[0]?.message?.tool_calls;
-    if (toolCalls && toolCalls.length > 0) {
-      reply = "🌐 *Recherche web effectuée*\n\n" + reply;
-    } else {
-      reply = "🌐 *Recherche web activée*\n\n" + reply;
-    }
-
     hideTyping();
-    state.messages.push({ role:"assistant", content:reply, ts:now(), webSearch:true, memoryUsed:relevantMems.length?relevantMems:undefined });
+    state.messages.push({ role:"assistant", content:reply, ts:now(), webSearch:false, memoryUsed:relevantMems.length?relevantMems:undefined });
     renderMessages();
     await saveChat();
   } catch(e) {
@@ -4428,7 +4389,7 @@ function initVoiceMode() {
   const openVoiceOverlay = () => {
     if (!state.apiKey) { toast("Configurez votre clé API Mistral d'abord", "error"); return; }
     voiceLiveActive = true;
-    voiceAutoRestart = false; // manual mode by default
+    voiceAutoRestart = true; // mode continu activé par défaut
     overlay.classList.add("active");
     btn.classList.add("voice-active");
     btn.textContent = "🎤 LIVE ●";
@@ -4467,55 +4428,14 @@ async function sendVoiceToMistral(text) {
     { role:"user", content: text }
   ];
 
-  let tools = undefined;
-  if (webSearchEnabled) {
-    tools = [{ type: "web_search" }];
-  }
-  
-  let body = { model: activeModelId, messages: contextMessages, temperature: agentTemp, max_tokens: 512 };
-  if (tools) { body.tools = tools; body.tool_choice = "auto"; }
+  // NOTE: Pas de tools web_search car non supportés par Mistral API nativement
+  const body = { model: activeModelId, messages: contextMessages, temperature: agentTemp, max_tokens: 512 };
 
-  let res = await fetch("https://api.mistral.ai/v1/chat/completions", {
+  const res = await fetch("https://api.mistral.ai/v1/chat/completions", {
     method: "POST",
     headers: { "Authorization": `Bearer ${state.apiKey}`, "Content-Type": "application/json" },
     body: JSON.stringify(body)
   });
-  
-  // Fallback to web_search_preview if web_search fails
-  if (!res.ok && res.status === 400 && webSearchEnabled) {
-    console.log("Voice: web_search failed, trying web_search_preview...");
-    body.tools = [{ type: "web_search_preview" }];
-    res = await fetch("https://api.mistral.ai/v1/chat/completions", {
-      method: "POST",
-      headers: { "Authorization": `Bearer ${state.apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify(body)
-    });
-  }
-  
-  // If still failing and web search is enabled, disable it and retry without tools
-  if (!res.ok && webSearchEnabled) {
-    const errText = await res.text().catch(() => "");
-    const isWebSearchError = errText.toLowerCase().includes("tool") || 
-                             errText.toLowerCase().includes("web_search") || 
-                             errText.toLowerCase().includes("not support") || 
-                             errText.toLowerCase().includes("unsupported") ||
-                             errText.toLowerCase().includes("invalid") ||
-                             errText.toLowerCase().includes("unknown");
-    
-    if (isWebSearchError || res.status === 400 || res.status === 403) {
-      console.log("Voice: Web search not supported, retrying without tools");
-      webSearchEnabled = false;
-      const btn = $("#toggle-websearch");
-      if (btn) { btn.classList.remove("web-active"); btn.textContent = "🌐 WEB"; }
-      delete body.tools;
-      delete body.tool_choice;
-      res = await fetch("https://api.mistral.ai/v1/chat/completions", {
-        method: "POST",
-        headers: { "Authorization": `Bearer ${state.apiKey}`, "Content-Type": "application/json" },
-        body: JSON.stringify(body)
-      });
-    }
-  }
   
   if (!res.ok) { 
     const err = await res.text().catch(() => "Erreur inconnue"); 
@@ -4529,12 +4449,12 @@ async function sendVoiceToMistral(text) {
 // INIT ALL NEW FEATURES
 // ════════════════════════════════════════
 document.addEventListener('DOMContentLoaded', () => {
-  // Small delay to ensure base init runs first
+  // Delay increased to 500ms to ensure base init runs first and DOM is fully ready
   setTimeout(() => {
     initWebSearch();
     initImageGeneration();
     initVoiceMode();
-  }, 200);
+  }, 500);
 });
 </script>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
