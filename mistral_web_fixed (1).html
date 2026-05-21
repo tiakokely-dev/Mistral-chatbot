@@ -1714,6 +1714,14 @@ body::before {
         <input type="password" class="field-input" id="api-key-input" placeholder="Collez votre clé ici…">
         <div class="field-hint">Format : min. 20 caractères — ex. <code style="font-family:var(--font-mono);color:var(--text-code);font-size:11px">sk-xxxxxxxxxxxxxxxxxxxxxxxx</code></div>
       </div>
+      
+      <!-- SERPAPI KEY FIELD -->
+      <div class="field-group" style="margin-top:16px">
+        <label class="field-label">🌐 Clé API SerpAPI (Recherche Web)</label>
+        <input type="password" class="field-input" id="serpapi-key-input" placeholder="Collez votre clé SerpAPI ici…">
+        <div class="field-hint">Optionnel — Nécessaire pour la recherche web en temps réel. Obtenez-la sur <code style="font-family:var(--font-mono);color:var(--text-code);font-size:11px">serpapi.com</code></div>
+      </div>
+      
       <div class="btn-row" style="margin-top:0;padding-top:0;border-top:none;margin-bottom:20px">
         <button class="btn-ghost" id="close-api-modal-2">Annuler</button>
         <button class="btn-ghost danger" id="delete-api-key" style="border-color:rgba(255,51,102,0.3);color:var(--danger)">🗑 SUPPRIMER</button>
@@ -3510,6 +3518,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   initAgentImport();
   initWizardEvents();
   initGenerateMoreAgents();
+  
+  // Init additional features (web search, image generation, voice mode)
+  initWebSearch();
+  initImageGeneration();
+  initVoiceMode();
 
   // Check first run / wizard
   const isFirstRun = await checkFirstRun();
@@ -3663,10 +3676,15 @@ function bindEvents() {
   };
 
   // API Modal
-  $("#open-api-modal").onclick = () => {
+  $("#open-api-modal").onclick = async () => {
     if (state.apiKey) {
       // Pre-fill with current key (masked display via type=password)
       $("#api-key-input").value = state.apiKey;
+    }
+    // Load saved SerpAPI key if exists
+    const serpConfig = await db.get('settings', 'serpapi_key');
+    if (serpConfig?.value) {
+      $("#serpapi-key-input").value = serpConfig.value;
     }
     $("#api-modal").classList.add("active");
   };
@@ -3677,6 +3695,8 @@ function bindEvents() {
 
   $("#save-api-key").onclick = () => {
     const k = $("#api-key-input").value.trim();
+    const serpKey = $("#serpapi-key-input").value.trim();
+    
     if (!isValidApiKey(k)) {
       toast("Clé invalide — min. 20 caractères alphanumériques", "error");
       return;
@@ -3686,8 +3706,16 @@ function bindEvents() {
     $("#api-status").innerHTML = '<span class="status-dot"></span>ONLINE';
     $("#api-status").className = "status-pill active";
     if ($("#api-status-mob")) { $("#api-status-mob").innerHTML = '<span class="status-dot"></span>ONLINE'; $("#api-status-mob").className = "status-pill active"; }
+    
+    // Save SerpAPI key if provided
+    if (serpKey && serpKey.length >= 10) {
+      db.put('settings', { id: 'serpapi_key', value: serpKey }).catch(()=>{});
+      toast("Clé API Mistral activée + Clé SerpAPI enregistrée !", "success");
+    } else {
+      toast("Clé API Mistral activée — persistante 365 jours !", "success");
+    }
+    
     closeApiModal();
-    toast("Clé API activée — persistante 365 jours !", "success");
     // If no AI config, show wizard step 2
     if (!state.aiConfig) setTimeout(() => showWizard(2), 500);
   };
@@ -3984,7 +4012,7 @@ function bindEvents() {
 }
 
 // ════════════════════════════════════════
-// 🌐 FEATURE 1 — WEB SEARCH (Mistral Native + Fallback)
+// 🌐 FEATURE 1 — WEB SEARCH (SerpAPI/Tavily Integration)
 // ════════════════════════════════════════
 let webSearchEnabled = false;
 
@@ -4009,11 +4037,23 @@ function initWebSearch() {
     btn.textContent = webSearchEnabled ? "🌐 WEB ✓" : "🌐 WEB";
     if (bar) bar.style.display = webSearchEnabled ? "flex" : "none";
     db.put('settings', { id:'websearch', value: webSearchEnabled }).catch(()=>{});
-    toast(webSearchEnabled ? "🌐 Recherche web activée" : "Recherche web désactivée", webSearchEnabled ? "success" : "info");
+    
+    // Check if API key is configured
+    if (webSearchEnabled) {
+      db.get('settings', 'serpapi_key').then(v => {
+        if (!v?.value) {
+          toast("⚠ Recherche web activée, mais aucune clé API SerpAPI/Tavily configurée. Les résultats seront basés sur les connaissances internes du modèle.", "warning");
+        } else {
+          toast("🌐 Recherche web activée avec SerpAPI/Tavily", "success");
+        }
+      });
+    } else {
+      toast("Recherche web désactivée", "info");
+    }
   };
 }
 
-// Wrapper pour envoyer les messages avec recherche web
+// Wrapper pour envoyer les messages avec recherche web via SerpAPI/Tavily
 async function sendMessageWithWebSearch() {
   const txt = $("#user-input").value.trim();
   if (!txt) return;
@@ -4039,9 +4079,40 @@ async function sendMessageWithWebSearch() {
   const agentMaxTok = state.agent?.maxTokens || 4096;
 
   try {
-    // NOTE: Mistral API ne supporte pas les tools web_search nativement dans /v1/chat/completions
-    // On utilise donc une instruction system forte pour demander au modèle de se baser sur ses connaissances
-    const systemPrompt = buildSystemPrompt() + "\\n\\nPour toute question sur l'actualité, les événements récents ou les informations pouvant avoir changé, indique clairement que tu ne peux pas accéder au web en temps réel et base-toi sur tes connaissances internes. Si l'utilisateur a besoin d'informations à jour, suggère-lui de consulter une source externe.";
+    // Try to get SerpAPI key from settings
+    const serpConfig = await db.get('settings', 'serpapi_key');
+    const serpApiKey = serpConfig?.value;
+    
+    let webContext = "";
+    
+    if (serpApiKey) {
+      // Perform real web search via SerpAPI
+      const encodedQuery = encodeURIComponent(txt);
+      const searchUrl = `https://serpapi.com/search.json?q=${encodedQuery}&api_key=${serpApiKey}&num=5&gl=fr&hl=fr`;
+      
+      try {
+        const searchRes = await fetch(searchUrl);
+        if (searchRes.ok) {
+          const searchData = await searchRes.json();
+          if (searchData.organic_results) {
+            webContext = "\n\n=== RÉSULTATS DE RECHERCHE WEB (SerpAPI) ===\n";
+            searchData.organic_results.slice(0, 5).forEach((result, idx) => {
+              webContext += `\n[${idx + 1}] ${result.title}\n   URL: ${result.link}\n   Résumé: ${result.snippet}\n`;
+            });
+            webContext += "==========================================\n\n";
+          }
+        }
+      } catch (searchErr) {
+        console.warn("SerpAPI search failed:", searchErr);
+        webContext = "\n⚠ La recherche web n'a pas pu être effectuée (erreur SerpAPI).\n";
+      }
+    } else {
+      // No API key - inform user and use internal knowledge
+      webContext = "\n⚠ Aucune clé API SerpAPI/Tavily configurée. Cette réponse est basée sur les connaissances internes du modèle.\nPour des informations à jour, configurez une clé API dans les paramètres.\n";
+    }
+    
+    // Build system prompt with web context
+    const systemPrompt = buildSystemPrompt() + "\n\n" + (webContext ? "Voici des informations de contexte provenant d'une recherche web :\n" + webContext : "") + "\nSi tu as utilisé des résultats de recherche web, cite tes sources en mentionnant les URLs. Si tu n'as pas accès à des informations récentes, indique-le clairement.";
     
     // Get conversation history
     const conversationHistory = (state.messages||[]).filter(m => m.role !== 'system').slice(-20).map(m => ({ role:m.role, content:m.content }));
@@ -4072,7 +4143,7 @@ async function sendMessageWithWebSearch() {
     let reply = data.choices?.[0]?.message?.content || "Aucune réponse";
     
     hideTyping();
-    state.messages.push({ role:"assistant", content:reply, ts:now(), webSearch:false, memoryUsed:relevantMems.length?relevantMems:undefined });
+    state.messages.push({ role:"assistant", content:reply, ts:now(), webSearch: !!serpApiKey, memoryUsed:relevantMems.length?relevantMems:undefined });
     renderMessages();
     await saveChat();
   } catch(e) {
@@ -4446,16 +4517,10 @@ async function sendVoiceToMistral(text) {
 }
 
 // ════════════════════════════════════════
-// INIT ALL NEW FEATURES
+// INIT ALL NEW FEATURES (removed - now called in main DOMContentLoaded)
 // ════════════════════════════════════════
-document.addEventListener('DOMContentLoaded', () => {
-  // Delay increased to 500ms to ensure base init runs first and DOM is fully ready
-  setTimeout(() => {
-    initWebSearch();
-    initImageGeneration();
-    initVoiceMode();
-  }, 500);
-});
+// No longer needed - initWebSearch(), initImageGeneration(), and initVoiceMode() 
+// are now called directly in the main DOMContentLoaded event handler
 </script>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 </body>
